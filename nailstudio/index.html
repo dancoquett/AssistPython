@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tarjetas de Fidelidad</title>
+    <script src="/_sdk/data_sdk.js"></script>
+    <script src="/_sdk/element_sdk.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+    <style>
+        body { box-sizing: border-box; margin: 0; padding: 0; height: 100%; }
+        html { height: 100%; }
+        .stamp { transition: all 0.3s ease; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1); }
+        .stamp.filled { transform: scale(1.1); box-shadow: 0 4px 6px rgba(0,0,0,0.1), 0 1px 3px rgba(0,0,0,0.08); }
+        .card-container { perspective: 1000px; }
+        .loyalty-card { transition: transform 0.4s ease-in-out, box-shadow 0.4s ease-in-out; box-shadow: 0 10px 15px rgba(0,0,0,0.1), 0 3px 6px rgba(0,0,0,0.05); border: 1px solid rgba(0,0,0,0.05); }
+        .loyalty-card:hover { transform: translateY(-8px); box-shadow: 0 20px 25px rgba(0,0,0,0.15), 0 10px 10px rgba(0,0,0,0.08); }
+        .action-btn { transition: background-color 0.3s, transform 0.1s; }
+        .action-btn:active { transform: scale(0.98); }
+        #loading-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255, 255, 255, 0.8); z-index: 100; display: flex; align-items: center; justify-content: center; transition: opacity 0.3s; }
+        #toast-container { position: fixed; top: 20px; right: 20px; z-index: 101; }
+        .toast { padding: 12px 20px; border-radius: 8px; color: white; margin-bottom: 10px; opacity: 0; transform: translateX(100%); transition: all 0.3s ease-in-out; }
+        .toast.show { opacity: 1; transform: translateX(0); }
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.5); z-index: 98; display: flex; align-items: center; justify-content: center; }
+        .modal { background: white; padding: 24px; border-radius: 12px; max-width: 400px; width: 90%; text-align: center; }
+    </style>
+</head>
+<body>
+    <div id="app" class="min-h-full"></div>
+    <div id="loading-overlay" style="display: none;"><div class="font-bold text-lg">Cargando...</div></div>
+    <div id="toast-container"></div>
+    <div id="modal-container"></div>
+
+    <script>
+        const LoyaltyApp = {
+            state: {
+                currentView: 'login',
+                currentUser: null,
+                users: [],
+            },
+
+            defaultConfig: {
+                background_color: "#f0f4f8", card_color: "#ffffff", primary_color: "#3b82f6",
+                text_color: "#1e293b", accent_color: "#10b981", business_name: "Mi Negocio",
+                business_logo: "☕", reward_text: "¡Recompensa gratis!", stamps_required: "10",
+                font_family: "Inter", font_size: 16
+            },
+
+            getConfig() {
+                return window.elementSdk?.config || this.defaultConfig;
+            },
+
+            async init() {
+                this.showLoading();
+                const initResult = await window.dataSdk.init({
+                    onDataChanged: (data) => { this.state.users = data; this.render(); }
+                });
+
+                if (!initResult.isOk) {
+                    console.error("Error initializing SDK");
+                    this.showToast("Error al cargar datos.", "error");
+                    this.hideLoading();
+                    return;
+                }
+
+                await this.initElementSdk();
+                await this.ensureSuperAdmin();
+                this.attachEventListeners();
+                this.render();
+                this.hideLoading();
+            },
+
+            render() {
+                const config = this.getConfig();
+                const app = document.getElementById('app');
+                document.body.style.backgroundColor = config.background_color;
+                app.style.fontSize = `${config.font_size}px`;
+                app.style.fontFamily = `${config.font_family}, sans-serif`;
+
+                let viewHtml;
+                switch(this.state.currentView) {
+                    case 'admin': viewHtml = this.renderAdminView(); break;
+                    case 'superadmin': viewHtml = this.renderSuperAdminView(); break;
+                    case 'client': viewHtml = this.renderClientView(); break;
+                    default: viewHtml = this.renderLoginView();
+                }
+
+                app.innerHTML = `
+                    <div class="min-h-full p-4 md:p-8">
+                        <div class="max-w-4xl mx-auto">
+                            ${this.renderHeader()}
+                            <div id="content">${viewHtml}</div>
+                        </div>
+                    </div>
+                `;
+                this.postRender();
+            },
+
+            renderHeader() {
+                const config = this.getConfig();
+                const { currentUser } = this.state;
+                let headerContent = `
+                    <div class="text-6xl mb-4">${config.business_logo}</div>
+                    <h1 class="font-bold tracking-tight" style="color: ${config.text_color}; font-size: ${config.font_size * 2.5}px;">${config.business_name}</h1>
+                `;
+                if (currentUser) {
+                    headerContent += `
+                        <div class="mt-4 flex justify-center items-center gap-4">
+                            <span class="font-semibold" style="color: ${config.text_color};">Bienvenido, ${currentUser.customer_name}</span>
+                            <button data-action="logout" class="text-blue-500 hover:text-blue-700 underline text-sm">Cerrar Sesión</button>
+                        </div>
+                    `;
+                }
+                return `<div class="text-center mb-8">${headerContent}</div>`;
+            },
+
+            renderLoginView() {
+                const c = this.getConfig();
+                return `<div class="max-w-md mx-auto">
+                    <div class="loyalty-card rounded-xl p-8 shadow-2xl" style="background-color: ${c.card_color};">
+                        <h2 class="font-bold text-center mb-6" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">🔑 Iniciar Sesión</h2>
+                        <form data-form="login" class="space-y-6">
+                            <div>
+                                <label for="login-username" class="block mb-2 font-medium text-left" style="color: ${c.text_color};">Usuario</label>
+                                <input id="login-username" name="username" required class="w-full px-4 py-3 rounded-xl border-2 focus:ring-4" style="border-color: ${c.primary_color}80; --tw-ring-color: ${c.primary_color};">
+                            </div>
+                            <div>
+                                <label for="login-password" class="block mb-2 font-medium text-left" style="color: ${c.text_color};">Contraseña</label>
+                                <input id="login-password" name="password" type="password" required class="w-full px-4 py-3 rounded-xl border-2 focus:ring-4" style="border-color: ${c.primary_color}80; --tw-ring-color: ${c.primary_color};">
+                            </div>
+                            <button type="submit" class="w-full py-3 rounded-xl font-extrabold text-white action-btn" style="background-color: ${c.primary_color};">Ingresar</button>
+                            <div class="login-error text-red-500 text-center font-semibold" style="display: none;"></div>
+                        </form>
+                    </div>
+                </div>`;
+            },
+
+            renderAdminView() {
+                const c = this.getConfig();
+                const clients = this.state.users.filter(u => u.type === 'client');
+                return `<div class="space-y-6">
+                    <div class="rounded-xl p-6 shadow-xl admin-panel-card" style="background-color: ${c.card_color};">
+                        <h2 class="font-bold mb-4" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">📝 Crear Nueva Tarjeta</h2>
+                        <form data-form="createClient" class="space-y-4 text-left">
+                            <div>
+                                <label for="client-name" class="block mb-2 font-medium" style="color: ${c.text_color};">Nombre del Cliente</label>
+                                <input id="client-name" name="name" required class="w-full px-4 py-2 rounded-xl border-2">
+                            </div>
+                            <div>
+                                <label for="client-username" class="block mb-2 font-medium" style="color: ${c.text_color};">Usuario de Acceso</label>
+                                <input id="client-username" name="username" required class="w-full px-4 py-2 rounded-xl border-2">
+                            </div>
+                            <div>
+                                <label for="client-password" class="block mb-2 font-medium" style="color: ${c.text_color};">Contraseña Inicial</label>
+                                <input id="client-password" name="password" type="password" required class="w-full px-4 py-2 rounded-xl border-2">
+                            </div>
+                            <button type="submit" class="w-full py-3 rounded-xl font-bold text-white action-btn" style="background-color: ${c.primary_color};">Crear Tarjeta</button>
+                        </form>
+                    </div>
+                    <div class="rounded-xl p-6 shadow-xl admin-panel-card" style="background-color: ${c.card_color};">
+                        <h2 class="font-bold mb-4" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">👥 Clientes (${clients.length})</h2>
+                        <div class="space-y-3">${clients.length > 0 ? clients.map(client => this.renderClientListItem(client)).join('') : '<p>No hay clientes.</p>'}</div>
+                    </div>
+                </div>`;
+            },
+
+            renderClientListItem(client) {
+                const c = this.getConfig();
+                const stampsRequired = parseInt(c.stamps_required);
+                return `<div class="p-4 rounded-xl border-2 flex flex-col md:flex-row justify-between items-start md:items-center shadow-sm" style="border-color: ${c.primary_color}30;">
+                    <div class="mb-3 md:mb-0 text-left">
+                        <p class="font-bold">${client.customer_name}</p>
+                        <p class="text-sm text-gray-600">Usuario: ${client.username}</p>
+                        <p class="font-medium mt-1 text-lg" style="color: ${c.accent_color};">${client.stamps}/${stampsRequired} sellos
+                            <span class="font-normal text-sm text-gray-500">(Total: ${client.total_stamps})</span>
+                        </p>
+                    </div>
+                    <div class="flex gap-2">
+                        <button data-action="addStamp" data-id="${client.id}" class="px-3 py-2 rounded-xl font-medium text-white action-btn" style="background-color: ${c.accent_color};">➕ Sello</button>
+                        <button data-action="resetCard" data-id="${client.id}" class="px-3 py-2 rounded-xl font-medium text-white action-btn" style="background-color: #f59e0b;">🔄 Reiniciar</button>
+                        <button data-action="deleteUser" data-id="${client.id}" class="px-3 py-2 rounded-xl font-medium text-white action-btn" style="background-color: #ef4444;">🗑️ Eliminar</button>
+                    </div>
+                </div>`;
+            },
+
+            renderSuperAdminView() {
+                const c = this.getConfig();
+                const admins = this.state.users.filter(u => u.type === 'admin');
+                const clients = this.state.users.filter(u => u.type === 'client');
+                return `<div class="space-y-6">
+                    <div class="rounded-xl p-6 shadow-xl admin-panel-card" style="background-color: ${c.card_color};">
+                        <h2 class="font-bold mb-4" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">⚙️ Configuración del Sistema</h2>
+                        <form data-form="saveConfig" class="space-y-4 text-left">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label for="config-business-name" class="block mb-2 font-medium" style="color: ${c.text_color};">Nombre del Negocio</label>
+                                    <input id="config-business-name" name="business_name" value="${c.business_name}" class="w-full px-4 py-2 rounded-xl border-2">
+                                </div>
+                                <div>
+                                    <label for="config-business-logo" class="block mb-2 font-medium" style="color: ${c.text_color};">Logo (Emoji)</label>
+                                    <input id="config-business-logo" name="business_logo" value="${c.business_logo}" class="w-full px-4 py-2 rounded-xl border-2">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label for="config-reward-text" class="block mb-2 font-medium" style="color: ${c.text_color};">Texto de Recompensa</label>
+                                    <input id="config-reward-text" name="reward_text" value="${c.reward_text}" class="w-full px-4 py-2 rounded-xl border-2">
+                                </div>
+                                <div>
+                                    <label for="config-stamps-required" class="block mb-2 font-medium" style="color: ${c.text_color};">Sellos Necesarios</label>
+                                    <input id="config-stamps-required" name="stamps_required" value="${c.stamps_required}" type="number" min="1" class="w-full px-4 py-2 rounded-xl border-2">
+                                </div>
+                            </div>
+                            <button type="submit" class="w-full py-3 rounded-xl font-bold text-white action-btn" style="background-color: ${c.accent_color};">Guardar Configuración</button>
+                        </form>
+                    </div>
+                    <div class="rounded-xl p-6 shadow-xl admin-panel-card" style="background-color: ${c.card_color};">
+                      <h2 class="font-bold mb-4" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">👨‍💼 Crear Administrador</h2>
+                      <form data-form="createAdmin" class="space-y-4 text-left">
+                        <div>
+                            <label for="admin-name" class="block mb-2 font-medium" style="color: ${c.text_color};">Nombre del Admin</label>
+                            <input id="admin-name" name="name" required class="w-full px-4 py-2 rounded-xl border-2">
+                        </div>
+                        <div>
+                            <label for="admin-username" class="block mb-2 font-medium" style="color: ${c.text_color};">Usuario de Acceso</label>
+                            <input id="admin-username" name="username" required class="w-full px-4 py-2 rounded-xl border-2">
+                        </div>
+                        <div>
+                            <label for="admin-password" class="block mb-2 font-medium" style="color: ${c.text_color};">Contraseña</label>
+                            <input id="admin-password" name="password" type="password" required class="w-full px-4 py-2 rounded-xl border-2">
+                        </div>
+                        <button type="submit" class="w-full py-3 rounded-xl font-bold text-white action-btn" style="background-color: ${c.primary_color};">Crear Admin</button>
+                      </form>
+                    </div>
+                    <div class="rounded-xl p-6 shadow-xl admin-panel-card" style="background-color: ${c.card_color};">
+                      <h2 class="font-bold mb-4" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">👥 Gestión de Usuarios</h2>
+                      <h3 class="font-bold mt-4 text-left">Admins (${admins.length})</h3>
+                      <div class="space-y-2 mb-4">${admins.length > 0 ? admins.map(admin => this.renderUserListItem(admin)).join('') : '<p>No hay admins.</p>'}</div>
+                      <h3 class="font-bold mt-4 text-left">Clientes (${clients.length})</h3>
+                      <div class="space-y-2">${clients.length > 0 ? clients.map(client => this.renderUserListItem(client)).join('') : '<p>No hay clientes.</p>'}</div>
+                    </div>
+                     <div class="rounded-xl p-6 shadow-xl admin-panel-card" style="background-color: ${c.card_color};">
+                        <h2 class="font-bold mb-4" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">🔄 Acciones del Sistema</h2>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <button data-action="resetAllCards" class="py-3 px-4 rounded-xl font-bold text-white action-btn" style="background-color: #f59e0b;">Reiniciar Todas las Tarjetas</button>
+                            <button data-action="exportData" class="py-3 px-4 rounded-xl font-bold text-white action-btn" style="background-color: ${c.accent_color};">Exportar Datos</button>
+                        </div>
+                    </div>
+                </div>`;
+            },
+
+            renderUserListItem(user) {
+                const c = this.getConfig();
+                return `<div class="p-3 rounded-xl border flex justify-between items-center" style="border-color: ${c.primary_color}50;">
+                    <div class="text-left">
+                        <p class="font-medium">${user.customer_name}</p>
+                        <p class="text-sm text-gray-500">Usuario: ${user.username}</p>
+                    </div>
+                    <button data-action="deleteUser" data-id="${user.id}" class="px-3 py-1 rounded-lg text-white action-btn" style="background-color: #ef4444;">Eliminar</button>
+                </div>`;
+            },
+
+            renderClientView() {
+                const c = this.getConfig();
+                const client = this.state.currentUser;
+                const stampsRequired = parseInt(c.stamps_required, 10);
+                return `<div class="max-w-md mx-auto">
+                    <div class="loyalty-card rounded-xl p-8 shadow-2xl" style="background-color: ${c.card_color};">
+                        <div class="text-center mb-6">
+                            <div class="text-4xl mb-2">${c.business_logo}</div>
+                            <h2 class="font-bold mb-2 tracking-tight" style="color: ${c.text_color}; font-size: ${c.font_size * 1.5}px;">${c.business_name}</h2>
+                            <p class="font-medium text-lg">${client.customer_name}</p>
+                        </div>
+                        <div class="grid grid-cols-5 gap-3 mb-8 p-3 rounded-xl border-2 border-dashed" style="border-color: ${c.primary_color}40;">
+                            ${Array.from({length: stampsRequired}, (_, i) => `
+                                <div class="stamp aspect-square rounded-full flex items-center justify-center ${i < client.stamps ? 'filled' : ''}" style="background-color: ${i < client.stamps ? c.accent_color : c.card_color}; border: 2px solid ${i < client.stamps ? c.accent_color : c.primary_color}80;">
+                                    <span class="text-2xl font-bold" style="color: ${i < client.stamps ? '#fff' : c.primary_color};">${i < client.stamps ? c.business_logo : (i + 1)}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                        ${client.stamps >= stampsRequired ? `
+                            <div class="text-center p-4 rounded-xl mb-6" style="background-color: ${c.accent_color}; color: #fff;">
+                                <p class="font-bold text-lg">🎉 ¡Reclama tu recompensa! 🎉</p>
+                                <p>${c.reward_text}</p>
+                            </div>
+                        ` : ''}
+                        <div class="text-center mb-4">
+                            <div id="client-qr-code" class="flex justify-center p-2 border-4 rounded-xl" style="border-color: ${c.primary_color}40;"></div>
+                            <p class="font-semibold mt-2">Muestra este código para sellar</p>
+                        </div>
+                    </div>
+                </div>`;
+            },
+
+            postRender() {
+                if (this.state.currentView === 'client') {
+                    this.generateClientQRCode();
+                }
+            },
+
+            generateClientQRCode() {
+                const qrContainer = document.getElementById('client-qr-code');
+                const client = this.state.currentUser;
+                if (qrContainer && client && client.qr_code) {
+                    qrContainer.innerHTML = '';
+                    new QRCode(qrContainer, { text: client.qr_code, width: 128, height: 128 });
+                }
+            },
+
+            attachEventListeners() {
+                document.getElementById('app').addEventListener('click', (e) => {
+                    const target = e.target.closest('[data-action]');
+                    if (target) {
+                        this.handleAction(target.dataset.action, target.dataset.id);
+                    }
+                });
+                document.getElementById('app').addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    const target = e.target.closest('[data-form]');
+                    if (target) {
+                        const formData = new FormData(target);
+                        const data = Object.fromEntries(formData.entries());
+                        this.handleForm(target.dataset.form, data, target);
+                    }
+                });
+            },
+
+            handleAction(action, id) {
+                switch(action) {
+                    case 'logout': this.logout(); break;
+                    case 'addStamp': this.addStamp(id); break;
+                    case 'resetCard': this.showConfirmation("Reiniciar Tarjeta", `¿Reiniciar los sellos para este cliente?`, () => this.resetCard(id)); break;
+                    case 'deleteUser':
+                        const user = this.state.users.find(u => u.id === id);
+                        this.showConfirmation("Eliminar Usuario", `¿Eliminar a ${user.customer_name}? Esta acción no se puede deshacer.`, () => this.deleteUser(id));
+                        break;
+                    case 'resetAllCards': this.showConfirmation("Reiniciar Todas las Tarjetas", `¿Estás seguro? Esta acción reiniciará los sellos de todos los clientes.`, () => this.resetAllCards()); break;
+                    case 'exportData': this.exportData(); break;
+                }
+            },
+
+            handleForm(form, data, element) {
+                switch(form) {
+                    case 'login': this.login(data, element); break;
+                    case 'createClient': this.createClient(data, element); break;
+                    case 'createAdmin': this.createAdmin(data, element); break;
+                    case 'saveConfig': this.saveConfig(data); break;
+                }
+            },
+
+            async login(data, form) {
+                const { username, password } = data;
+                const errorDiv = form.querySelector('.login-error');
+                const user = this.state.users.find(u => u.username === username && u.password === password);
+
+                this.showLoading();
+                await new Promise(res => setTimeout(res, 500));
+                this.hideLoading();
+
+                if (user) {
+                    this.state.currentUser = user;
+                    this.state.currentView = user.type;
+                    this.render();
+                } else {
+                    errorDiv.textContent = 'Usuario o contraseña incorrectos.';
+                    errorDiv.style.display = 'block';
+                }
+            },
+
+            logout() {
+                this.state.currentUser = null;
+                this.state.currentView = 'login';
+                this.render();
+            },
+
+            async createClient(data, form) {
+                if (this.state.users.find(u => u.username === data.username)) {
+                    this.showToast("Este nombre de usuario ya existe.", "error");
+                    return;
+                }
+                this.showLoading();
+                const clientId = Date.now().toString();
+                await window.dataSdk.create({
+                    id: clientId, type: 'client', username: data.username, password: data.password,
+                    customer_name: data.name, stamps: 0, total_stamps: 0, created_at: new Date().toISOString(),
+                    last_stamp: '', qr_code: `client-${clientId}`, is_registered: true
+                });
+                form.reset();
+                this.hideLoading();
+                this.showToast("Cliente creado con éxito.");
+            },
+
+            async createAdmin(data, form) {
+                if (this.state.users.find(u => u.username === data.username)) {
+                    this.showToast("Este nombre de usuario ya existe.", "error");
+                    return;
+                }
+                this.showLoading();
+                const adminId = Date.now().toString();
+                await window.dataSdk.create({
+                    id: adminId, type: 'admin', username: data.username, password: data.password,
+                    customer_name: data.name, stamps: 0, total_stamps: 0, created_at: new Date().toISOString(),
+                    last_stamp: '', qr_code: '', is_registered: true
+                });
+                form.reset();
+                this.hideLoading();
+                this.showToast("Administrador creado con éxito.");
+            },
+
+            async addStamp(clientId) {
+                this.showLoading();
+                const client = this.state.users.find(u => u.id === clientId);
+                if (client) {
+                    const stampsRequired = parseInt(this.getConfig().stamps_required, 10);
+                    let newStamps = client.stamps + 1;
+                    if (newStamps >= stampsRequired) {
+                        this.showToast("¡Recompensa completada!", "success");
+                        newStamps = 0;
+                    }
+                    await window.dataSdk.update({ ...client, stamps: newStamps, total_stamps: client.total_stamps + 1, last_stamp: new Date().toISOString() });
+                }
+                this.hideLoading();
+            },
+
+            async resetCard(clientId) {
+                this.showLoading();
+                const client = this.state.users.find(u => u.id === clientId);
+                if (client) {
+                    await window.dataSdk.update({ ...client, stamps: 0 });
+                    this.showToast("Tarjeta del cliente reiniciada.");
+                }
+                this.hideLoading();
+            },
+
+            async deleteUser(userId) {
+                this.showLoading();
+                const user = this.state.users.find(u => u.id === userId);
+                if (user) {
+                    await window.dataSdk.delete(user);
+                    this.showToast("Usuario eliminado.");
+                }
+                this.hideLoading();
+            },
+             async saveConfig(data) {
+                this.showLoading();
+                await window.elementSdk.setConfig(data);
+                this.hideLoading();
+                this.showToast("Configuración guardada.");
+            },
+             async resetAllCards() {
+                this.showLoading();
+                const clientUpdates = this.state.users
+                    .filter(u => u.type === 'client')
+                    .map(client => window.dataSdk.update({ ...client, stamps: 0 }));
+                await Promise.all(clientUpdates);
+                this.hideLoading();
+                this.showToast("Todas las tarjetas de cliente han sido reiniciadas.");
+            },
+             exportData() {
+                const dataToExport = {
+                    users: this.state.users,
+                    config: this.getConfig(),
+                    exportedAt: new Date().toISOString()
+                };
+                const dataStr = JSON.stringify(dataToExport, null, 2);
+                const blob = new Blob([dataStr], {type: "application/json"});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `data-export-${Date.now()}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+                this.showToast("Datos exportados.");
+            },
+
+            async ensureSuperAdmin() {
+                return new Promise(resolve => {
+                    setTimeout(async () => {
+                        const superAdminExists = this.state.users.find(u => u.type === 'superadmin');
+                        if (!superAdminExists && this.state.users.length === 0) {
+                            await window.dataSdk.create({
+                                id: 'superadmin-default', type: 'superadmin', username: 'daniroot', password: 'Menona25',
+                                customer_name: 'Super Administrador', is_registered: true
+                            });
+                        }
+                        resolve();
+                    }, 200);
+                });
+            },
+
+            async initElementSdk() {
+              await window.elementSdk.init({
+                defaultConfig: this.defaultConfig,
+                onConfigChange: (config) => this.render(),
+                mapToCapabilities: (config) => ({
+                    recolorables: [
+                        { get: () => config.background_color, set: (value) => window.elementSdk.setConfig({ background_color: value }) },
+                        { get: () => config.card_color, set: (value) => window.elementSdk.setConfig({ card_color: value }) },
+                        { get: () => config.primary_color, set: (value) => window.elementSdk.setConfig({ primary_color: value }) },
+                        { get: () => config.text_color, set: (value) => window.elementSdk.setConfig({ text_color: value }) },
+                        { get: () => config.accent_color, set: (value) => window.elementSdk.setConfig({ accent_color: value }) }
+                    ],
+                    fontEditable: { get: () => config.font_family, set: (value) => window.elementSdk.setConfig({ font_family: value }) },
+                    fontSizeable: { get: () => config.font_size, set: (value) => window.elementSdk.setConfig({ font_size: value }) }
+                }),
+                mapToEditPanelValues: (config) => new Map([
+                    ["business_name", config.business_name],
+                    ["business_logo", config.business_logo],
+                    ["reward_text", config.reward_text],
+                    ["stamps_required", config.stamps_required]
+                ])
+              });
+            },
+
+            showLoading() { document.getElementById('loading-overlay').style.display = 'flex'; },
+            hideLoading() { document.getElementById('loading-overlay').style.display = 'none'; },
+            showToast(message, type = 'success') {
+                const c = this.getConfig();
+                const toastContainer = document.getElementById('toast-container');
+                const toast = document.createElement('div');
+                toast.className = 'toast';
+                toast.style.backgroundColor = type === 'success' ? c.accent_color : '#ef4444';
+                toast.textContent = message;
+                toastContainer.appendChild(toast);
+                setTimeout(() => toast.classList.add('show'), 10);
+                setTimeout(() => {
+                    toast.classList.remove('show');
+                    setTimeout(() => toast.remove(), 300);
+                }, 3000);
+            },
+            showConfirmation(title, message, onConfirm) {
+                const modalContainer = document.getElementById('modal-container');
+                modalContainer.innerHTML = `<div class="modal-overlay">
+                    <div class="modal">
+                        <h3 class="font-bold text-lg mb-2">${title}</h3>
+                        <p class="mb-4">${message}</p>
+                        <div class="flex justify-center gap-4">
+                            <button class="px-4 py-2 rounded-lg bg-gray-200" data-action="close-modal">Cancelar</button>
+                            <button id="confirm-action-btn" class="px-4 py-2 rounded-lg text-white" style="background-color: #ef4444;">Confirmar</button>
+                        </div>
+                    </div>
+                </div>`;
+                modalContainer.querySelector('#confirm-action-btn').onclick = () => { onConfirm(); modalContainer.innerHTML = ''; };
+                modalContainer.querySelector('[data-action="close-modal"]').onclick = () => { modalContainer.innerHTML = ''; };
+            },
+        };
+
+        document.addEventListener('DOMContentLoaded', () => LoyaltyApp.init());
+    </script>
+</body>
+</html>
